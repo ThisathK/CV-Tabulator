@@ -1,9 +1,3 @@
-import os
-import certifi
-
-os.environ['SSL_CERT_FILE'] = certifi.where()
-os.environ['SSL_CERT_DIR'] = os.path.dirname(certifi.where())
-
 import asyncio
 import base64
 import logging
@@ -11,6 +5,11 @@ import os
 import re
 import uuid
 from typing import List
+
+import certifi
+
+os.environ["SSL_CERT_FILE"] = certifi.where()
+os.environ["SSL_CERT_DIR"] = os.path.dirname(certifi.where())
 
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
@@ -227,3 +226,11 @@ async def upload_cv(file: UploadFile = File(...)):
 @app.get("/")
 async def health_check():
     return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    # Render (and most PaaS hosts) inject the port to bind via $PORT - never
+    # hardcode a port for production. Falls back to 8000 for local runs.
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

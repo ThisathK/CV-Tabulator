@@ -95,6 +95,35 @@ every field is the string `"Failed to parse"`, plus an `error` key with the unde
 reason. This keeps a single bad resume or API hiccup from crashing the request or leaving
 the frontend table in a broken state.
 
+## Deploying to Render
+
+**Backend (Web Service)**
+
+- **Root directory:** `backend`
+- **Build command:** `pip install -r requirements.txt`
+- **Start command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
+  (`main.py` also honors `$PORT` if you ever run it as `python main.py` instead.)
+- **Environment variable:** set `GEMINI_API_KEY` in the Render dashboard — never commit
+  a real key to `.env` in git (`.env` is already gitignored; only `.env.example` is tracked).
+
+**Frontend (Static Site)**
+
+- **Root directory:** `frontend`
+- **Publish directory:** `.` (it's plain static HTML/JS, no build step)
+- After deploying the backend, copy its `https://….onrender.com` URL into
+  `frontend/app.js`, replacing the `REPLACE-WITH-YOUR-RENDER-BACKEND-URL` placeholder.
+  Local development is unaffected — `app.js` auto-detects `localhost` and keeps using
+  `http://localhost:8000` there.
+- Once you have a stable frontend origin, tighten `main.py`'s
+  `CORSMiddleware(allow_origins=["*"])` to that exact origin instead of `*`.
+
+**No persistent disk needed.** The app never writes to the filesystem — uploaded PDFs are
+processed in memory and the original file is returned to the client as a base64 string in
+the response body (`cv_base64`), not saved to disk. This means Render's free-tier ephemeral
+filesystem (wiped on every restart/deploy) is not a concern here. If you later add anything
+that writes to disk (caching, temp files, logs you want to keep), that data will not survive
+a restart on Render's free tier — use a database or object storage (S3, Render Disks) instead.
+
 ## Notes / next steps for production
 
 - Add file size limits and stricter MIME/extension checks on the backend.
