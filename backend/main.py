@@ -32,7 +32,7 @@ app = FastAPI(title="CV Tabulator API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://cv-tabulator-frontend.onrender.com"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
