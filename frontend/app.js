@@ -1,9 +1,9 @@
-// Local dev hits the local backend automatically; anywhere else, point this
-// at your deployed Render backend URL (e.g. "https://cv-tabulator-api.onrender.com").
+// Local dev hits the local backend automatically; anywhere else, use the
+// deployed Render backend.
 const isLocalhost = ["localhost", "127.0.0.1"].includes(window.location.hostname);
 const API_URL = isLocalhost
   ? "http://localhost:8000"
-  : "https://REPLACE-WITH-YOUR-RENDER-BACKEND-URL.onrender.com";
+  : "https://cv-tabulator.onrender.com";
 
 const dropZone = document.getElementById("drop-zone");
 const fileInput = document.getElementById("file-input");
