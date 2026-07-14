@@ -161,17 +161,39 @@ async function uploadFile(file, rowId) {
 }
 
 function candidatesToCsv() {
-  const headers = ["Name", "Email", "Phone", "Location", "Position", "Experience (Years)", "Top Skills", "Education"];
-  const rows = Array.from(candidates.values()).map((c) => [
-    c.name,
-    c.email,
-    c.phone,
-    c.location,
-    c.position,
-    c.experience_years,
-    c.top_skills,
-    c.highest_education,
-  ]);
+  const headers = [
+    "Name", "Email", "Phone", "Location", "Position", "Experience (Years)",
+    "Top Skills", "Education", "WGE", "Accept", "Reject", "Comments",
+  ];
+  const rows = Array.from(candidates.entries()).map(([rowId, c]) => {
+    const tr = document.getElementById(rowId);
+    const wgeSelect = tr ? tr.querySelector('[data-role="wge-select"]') : null;
+    const acceptBox = tr ? tr.querySelector('[data-role="accept-checkbox"]') : null;
+    const rejectBox = tr ? tr.querySelector('[data-role="reject-checkbox"]') : null;
+    const commentsInput = tr ? tr.querySelector('[data-role="comments-input"]') : null;
+
+    const wge = wgeSelect && wgeSelect.selectedOptions.length
+      ? wgeSelect.selectedOptions[0].textContent
+      : "";
+    const accept = acceptBox && acceptBox.checked ? "Yes" : "No";
+    const reject = rejectBox && rejectBox.checked ? "Yes" : "No";
+    const comments = commentsInput ? commentsInput.value : "";
+
+    return [
+      c.name,
+      c.email,
+      c.phone,
+      c.location,
+      c.position,
+      c.experience_years,
+      c.top_skills,
+      c.highest_education,
+      wge,
+      accept,
+      reject,
+      comments,
+    ];
+  });
 
   const escapeCsvField = (field) => {
     const str = String(field ?? "");
