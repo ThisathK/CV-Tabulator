@@ -3,8 +3,8 @@ import base64
 import logging
 import os
 import re
-import uuid
-from typing import List
+import secrets
+from typing import List, Optional
 
 import certifi
 
@@ -13,14 +13,18 @@ os.environ["SSL_CERT_DIR"] = os.path.dirname(certifi.where())
 
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 from pydantic import BaseModel
+from sqlalchemy import Column, Integer, String, Text, create_engine
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
-load_dotenv()  # reads GEMINI_API_KEY from a local .env file
+load_dotenv()  # reads GEMINI_API_KEY (and DATABASE_URL, BASIC_AUTH_*) from .env
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,11 +32,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cv_tabulator")
 
-app = FastAPI(title="CV Tabulator API")
+FRONTEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "frontend"))
+
+app = FastAPI(title="CV Tabulator API", docs_url=None, redoc_url=None, openapi_url=None)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://cv-tabulator-frontend.onrender.com"],
+    # Kept for the legacy separately-hosted-frontend workflow; the primary
+    # workflow is now this backend serving the frontend at the same origin
+    # (see "/" and "/app.js" below), which is required for the browser's
+    # native Basic Auth popup to appear at all - cross-origin fetch() calls
+    # never trigger it, only full-page navigations do.
+    allow_origins=["https://cv-tabulator-frontend.onrender.com", "http://localhost:5500"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -164,8 +175,119 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
     return "\n".join(text_parts)
 
 
-@app.post("/upload")
-async def upload_cv(file: UploadFile = File(...)):
+# --- Database setup -----------------------------------------------------
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./candidates.db")
+if DATABASE_URL.startswith("postgres://"):
+    # Render's managed Postgres add-on hands out "postgres://" URLs, but
+    # SQLAlchemy 1.4+/2.0 requires the "postgresql://" scheme.
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+_engine_kwargs = {}
+if DATABASE_URL.startswith("sqlite"):
+    _engine_kwargs["connect_args"] = {"check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, **_engine_kwargs)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+class CandidateDB(Base):
+    __tablename__ = "candidates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String, default="")
+    name = Column(String, default="")
+    email = Column(String, default="")
+    phone = Column(String, default="")
+    location = Column(String, default="")
+    position = Column(String, default="")
+    experience_years = Column(Integer, default=0)
+    top_skills = Column(String, default="")
+    highest_education = Column(String, default="")
+    cv_base64 = Column(Text, default="")
+    # Collaborative review fields, editable from the frontend after upload.
+    status = Column(String, default="Pending")
+    light = Column(String, default="")
+    remarks = Column(Text, default="")
+
+
+Base.metadata.create_all(bind=engine)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def candidate_to_dict(row: CandidateDB) -> dict:
+    return {
+        "id": row.id,
+        "filename": row.filename,
+        "name": row.name,
+        "email": row.email,
+        "phone": row.phone,
+        "location": row.location,
+        "position": row.position,
+        "experience_years": row.experience_years,
+        "top_skills": row.top_skills,
+        "highest_education": row.highest_education,
+        "cv_base64": row.cv_base64,
+        "status": row.status,
+        "light": row.light,
+        "remarks": row.remarks,
+    }
+
+
+class CandidateUpdate(BaseModel):
+    status: Optional[str] = None
+    light: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+# --- Basic auth -----------------------------------------------------------
+
+security = HTTPBasic()
+# Hardcoded for now, as requested - overridable via env vars whenever you're
+# ready to rotate them without another code change.
+BASIC_AUTH_USERNAME = os.getenv("BASIC_AUTH_USERNAME", "admin")
+BASIC_AUTH_PASSWORD = os.getenv("BASIC_AUTH_PASSWORD", "password")
+
+
+def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)) -> str:
+    correct_username = secrets.compare_digest(credentials.username, BASIC_AUTH_USERNAME)
+    correct_password = secrets.compare_digest(credentials.password, BASIC_AUTH_PASSWORD)
+    if not (correct_username and correct_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+
+# Every route on this router requires login - added in one place so no
+# individual endpoint can accidentally be left unprotected.
+protected = APIRouter(dependencies=[Depends(verify_credentials)])
+
+
+@protected.get("/")
+async def serve_frontend():
+    return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
+
+
+@protected.get("/app.js")
+async def serve_app_js():
+    return FileResponse(
+        os.path.join(FRONTEND_DIR, "app.js"), media_type="application/javascript"
+    )
+
+
+@protected.post("/upload")
+async def upload_cv(file: UploadFile = File(...), db: Session = Depends(get_db)):
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
@@ -214,8 +336,24 @@ async def upload_cv(file: UploadFile = File(...)):
 
     cv_base64 = base64.b64encode(file_bytes).decode("utf-8")
 
+    db_candidate = CandidateDB(
+        filename=file.filename,
+        name=parsed["name"],
+        email=parsed["email"],
+        phone=parsed["phone"],
+        location=parsed["location"],
+        position=parsed["position"],
+        experience_years=parsed["experience_years"],
+        top_skills=parsed["top_skills"],
+        highest_education=parsed["highest_education"],
+        cv_base64=cv_base64,
+    )
+    db.add(db_candidate)
+    db.commit()
+    db.refresh(db_candidate)
+
     return {
-        "id": str(uuid.uuid4()),
+        "id": db_candidate.id,
         "filename": file.filename,
         "status": "success",
         "data": parsed,
@@ -223,8 +361,56 @@ async def upload_cv(file: UploadFile = File(...)):
     }
 
 
-@app.get("/")
+@protected.get("/candidates")
+async def list_candidates(db: Session = Depends(get_db)):
+    rows = db.query(CandidateDB).order_by(CandidateDB.id.asc()).all()
+    return [candidate_to_dict(row) for row in rows]
+
+
+@protected.patch("/candidates/{candidate_id}")
+async def update_candidate(
+    candidate_id: int, update: CandidateUpdate, db: Session = Depends(get_db)
+):
+    row = db.query(CandidateDB).filter(CandidateDB.id == candidate_id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    if update.status is not None:
+        row.status = update.status
+    if update.light is not None:
+        row.light = update.light
+    if update.remarks is not None:
+        row.remarks = update.remarks
+
+    db.commit()
+    db.refresh(row)
+    return candidate_to_dict(row)
+
+
+@protected.delete("/candidates/{candidate_id}")
+async def delete_candidate(candidate_id: int, db: Session = Depends(get_db)):
+    row = db.query(CandidateDB).filter(CandidateDB.id == candidate_id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    db.delete(row)
+    db.commit()
+    return {"status": "deleted", "id": candidate_id}
+
+
+@protected.delete("/candidates")
+async def delete_all_candidates(db: Session = Depends(get_db)):
+    count = db.query(CandidateDB).delete()
+    db.commit()
+    return {"status": "deleted_all", "count": count}
+
+
+app.include_router(protected)
+
+
+@app.get("/healthz")
 async def health_check():
+    # Deliberately NOT behind auth - PaaS platforms (Render included) need an
+    # unauthenticated route to confirm the service is alive.
     return {"status": "ok"}
 
 

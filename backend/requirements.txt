@@ -6,3 +6,5 @@ google-genai
 pydantic
 python-dotenv
 certifi
+SQLAlchemy
+psycopg2-binary

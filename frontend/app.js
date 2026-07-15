@@ -10,17 +10,22 @@ const fileInput = document.getElementById("file-input");
 const tableBody = document.getElementById("table-body");
 const emptyRow = document.getElementById("empty-row");
 const downloadBtn = document.getElementById("download-csv");
+const clearAllBtn = document.getElementById("clear-all-btn");
 
 const cvModal = document.getElementById("cv-modal");
 const cvModalFrame = document.getElementById("cv-modal-frame");
 const cvModalTitle = document.getElementById("cv-modal-title");
 const cvModalClose = document.getElementById("cv-modal-close");
 
-// rowId -> candidate data (including cv_base64), for successfully parsed rows only
+// rowId -> candidate data (including cv_base64 and the backend's dbId), for
+// successfully parsed/loaded rows only
 const candidates = new Map();
 
 // The blob URL currently loaded in the CV modal, so it can be revoked on close.
 let activeCvObjectUrl = null;
+
+// rowId -> pending debounce timer, for the Comments field's autosave.
+const commentsDebounceTimers = new Map();
 
 function updateDownloadButtonState() {
   downloadBtn.disabled = candidates.size === 0;
@@ -32,13 +37,19 @@ function ensureEmptyRowHidden() {
   }
 }
 
+function showEmptyRowIfNeeded() {
+  if (tableBody.children.length === 0) {
+    tableBody.appendChild(emptyRow);
+  }
+}
+
 function createProcessingRow(rowId, filename) {
   ensureEmptyRowHidden();
 
   const tr = document.createElement("tr");
   tr.id = rowId;
   tr.innerHTML = `
-    <td class="px-6 py-4 font-medium text-slate-700" colspan="11">
+    <td class="px-6 py-4 font-medium text-slate-700" colspan="12">
       <div class="flex items-center gap-3">
         <svg class="h-4 w-4 animate-spin text-indigo-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
           <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
@@ -105,7 +116,38 @@ function renderSuccessRow(rowId, data) {
         class="w-40 rounded-md border border-slate-300 px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
       />
     </td>
+    <td class="px-4 py-3 text-center">
+      <button
+        type="button"
+        data-action="delete-row"
+        data-row-id="${rowId}"
+        class="rounded-md p-1 text-slate-400 hover:bg-red-50 hover:text-red-600"
+        aria-label="Delete candidate"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
+        </svg>
+      </button>
+    </td>
   `;
+}
+
+// Restores WGE/Accept/Reject/Comments UI state from a saved DB row
+// ({ status, light, remarks }) - used both for freshly-loaded rows and
+// (harmlessly, since defaults match a blank UI) for brand-new uploads.
+function applySavedState(rowId, saved) {
+  const tr = document.getElementById(rowId);
+  if (!tr) return;
+
+  const wgeSelect = tr.querySelector('[data-role="wge-select"]');
+  const acceptBox = tr.querySelector('[data-role="accept-checkbox"]');
+  const rejectBox = tr.querySelector('[data-role="reject-checkbox"]');
+  const commentsInput = tr.querySelector('[data-role="comments-input"]');
+
+  if (wgeSelect) wgeSelect.value = saved.light || "";
+  if (acceptBox) acceptBox.checked = saved.status === "Accepted";
+  if (rejectBox) rejectBox.checked = saved.status === "Rejected";
+  if (commentsInput) commentsInput.value = saved.remarks || "";
 }
 
 function renderErrorRow(rowId, filename, message) {
@@ -113,7 +155,7 @@ function renderErrorRow(rowId, filename, message) {
   if (!tr) return;
 
   tr.innerHTML = `
-    <td class="px-6 py-4 text-red-600" colspan="11">
+    <td class="px-6 py-4 text-red-600" colspan="12">
       Failed to process <span class="font-medium">${escapeHtml(filename)}</span>: ${escapeHtml(message)}
     </td>
   `;
@@ -152,12 +194,115 @@ async function uploadFile(file, rowId) {
     }
 
     const result = await response.json();
-    candidates.set(rowId, { ...result.data, cv_base64: result.cv_base64, filename: result.filename });
+    candidates.set(rowId, {
+      ...result.data,
+      cv_base64: result.cv_base64,
+      filename: result.filename,
+      dbId: result.id,
+    });
     renderSuccessRow(rowId, result.data);
+    applySavedState(rowId, { status: "Pending", light: "", remarks: "" });
     updateDownloadButtonState();
   } catch (err) {
     renderErrorRow(rowId, file.name, err.message);
   }
+}
+
+// --- Loading existing candidates on page load ---
+
+async function loadCandidates() {
+  try {
+    const response = await fetch(`${API_URL}/candidates`);
+    if (!response.ok) return;
+
+    const rows = await response.json();
+    for (const row of rows) {
+      const rowId = `row-db-${row.id}`;
+      candidates.set(rowId, {
+        name: row.name,
+        email: row.email,
+        phone: row.phone,
+        location: row.location,
+        position: row.position,
+        experience_years: row.experience_years,
+        top_skills: row.top_skills,
+        highest_education: row.highest_education,
+        cv_base64: row.cv_base64,
+        filename: row.filename,
+        dbId: row.id,
+      });
+      createProcessingRow(rowId, row.filename);
+      renderSuccessRow(rowId, candidates.get(rowId));
+      applySavedState(rowId, row);
+    }
+    updateDownloadButtonState();
+  } catch (err) {
+    console.error("Failed to load existing candidates:", err);
+  }
+}
+
+// --- Auto-save (PATCH /candidates/{id}) ---
+
+async function patchCandidate(rowId, updates) {
+  const candidate = candidates.get(rowId);
+  if (!candidate || candidate.dbId == null) return;
+
+  try {
+    await fetch(`${API_URL}/candidates/${candidate.dbId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updates),
+    });
+  } catch (err) {
+    console.error(`Failed to save update for row ${rowId}:`, err);
+  }
+}
+
+function debounceSaveRemarks(rowId, value) {
+  if (commentsDebounceTimers.has(rowId)) {
+    clearTimeout(commentsDebounceTimers.get(rowId));
+  }
+  const timeoutId = setTimeout(() => {
+    patchCandidate(rowId, { remarks: value });
+    commentsDebounceTimers.delete(rowId);
+  }, 500);
+  commentsDebounceTimers.set(rowId, timeoutId);
+}
+
+// --- Deletion ---
+
+async function deleteRow(rowId) {
+  if (!confirm("Delete this candidate?")) return;
+
+  const candidate = candidates.get(rowId);
+  if (candidate && candidate.dbId != null) {
+    try {
+      await fetch(`${API_URL}/candidates/${candidate.dbId}`, { method: "DELETE" });
+    } catch (err) {
+      console.error("Failed to delete candidate on server:", err);
+    }
+  }
+
+  candidates.delete(rowId);
+  const tr = document.getElementById(rowId);
+  if (tr) tr.remove();
+  updateDownloadButtonState();
+  showEmptyRowIfNeeded();
+}
+
+async function clearAllCandidates() {
+  if (!confirm("Are you sure? This cannot be undone.")) return;
+
+  try {
+    await fetch(`${API_URL}/candidates`, { method: "DELETE" });
+  } catch (err) {
+    console.error("Failed to clear candidates on server:", err);
+  }
+
+  candidates.clear();
+  tableBody.innerHTML = "";
+  showEmptyRowIfNeeded();
+  updateDownloadButtonState();
 }
 
 function candidatesToCsv() {
@@ -287,16 +432,24 @@ dropZone.addEventListener("drop", (e) => {
 });
 
 downloadBtn.addEventListener("click", downloadCsv);
+clearAllBtn.addEventListener("click", clearAllCandidates);
 
-// Delegated click handling for dynamically-created "View CV" buttons.
+// Delegated click handling for dynamically-created "View CV" / "Delete" buttons.
 tableBody.addEventListener("click", (e) => {
   const viewCvBtn = e.target.closest('[data-action="view-cv"]');
   if (viewCvBtn) {
     openCvModal(viewCvBtn.dataset.rowId);
+    return;
+  }
+
+  const deleteBtn = e.target.closest('[data-action="delete-row"]');
+  if (deleteBtn) {
+    deleteRow(deleteBtn.dataset.rowId);
   }
 });
 
-// Delegated change handling: keep Accept/Reject checkboxes mutually exclusive per row.
+// Delegated change handling: keep Accept/Reject checkboxes mutually exclusive
+// per row, and auto-save Accept/Reject/WGE changes to the backend.
 tableBody.addEventListener("change", (e) => {
   const target = e.target;
   const row = target.closest("tr");
@@ -310,6 +463,25 @@ tableBody.addEventListener("change", (e) => {
   if (target.matches('[data-role="reject-checkbox"]') && target.checked) {
     const acceptBox = row.querySelector('[data-role="accept-checkbox"]');
     if (acceptBox) acceptBox.checked = false;
+  }
+
+  if (target.matches('[data-role="accept-checkbox"], [data-role="reject-checkbox"]')) {
+    const acceptBox = row.querySelector('[data-role="accept-checkbox"]');
+    const rejectBox = row.querySelector('[data-role="reject-checkbox"]');
+    const status = acceptBox.checked ? "Accepted" : rejectBox.checked ? "Rejected" : "Pending";
+    patchCandidate(row.id, { status });
+  }
+
+  if (target.matches('[data-role="wge-select"]')) {
+    patchCandidate(row.id, { light: target.value });
+  }
+});
+
+// Debounced auto-save for the Comments field, so we don't PATCH on every keystroke.
+tableBody.addEventListener("input", (e) => {
+  if (e.target.matches('[data-role="comments-input"]')) {
+    const row = e.target.closest("tr");
+    if (row) debounceSaveRemarks(row.id, e.target.value);
   }
 });
 
@@ -325,3 +497,5 @@ document.addEventListener("keydown", (e) => {
     closeCvModal();
   }
 });
+
+loadCandidates();
